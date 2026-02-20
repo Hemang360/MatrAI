@@ -4,3 +4,4 @@ supabase
 pydantic-settings
 openai
 python-dotenv
+sarvamai
