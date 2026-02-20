@@ -34,13 +34,16 @@ Tool JSON schema (registered with the VAPI assistant in vapi.py):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from app.config import get_settings
 from app.prompts import build_system_prompt
 from app.triage import evaluate_risk
 
@@ -158,6 +161,13 @@ async def vapi_tool(request: Request) -> JSONResponse:
     engine, and returns a structured result string that VAPI feeds back to
     the LLM to speak aloud.
 
+    Emergency transfer (RED):
+        If triage returns RED, we ALSO fire a background VAPI Control API
+        call to transfer the call to DOCTOR_PHONE_NUMBER. This happens
+        concurrently with returning the tool result so there's no delay.
+        The tool result instructs the LLM to speak the bridge message;
+        the control API then physically transfers the call.
+
     Expected VAPI payload:
         {
           "message": {
@@ -178,13 +188,6 @@ async def vapi_tool(request: Request) -> JSONResponse:
             }]
           }
         }
-
-    VAPI tool result format:
-        { "results": [{ "toolCallId": "tc_xxx", "result": "<string>" }] }
-
-    The `result` string is a JSON payload the LLM reads to determine
-    what to speak. The system prompt (INITIAL_SYSTEM_PROMPT) instructs it
-    to speak the mandatory_action verbatim.
     """
     try:
         body: dict[str, Any] = await request.json()
@@ -198,14 +201,18 @@ async def vapi_tool(request: Request) -> JSONResponse:
         logger.warning("Unexpected event type at /vapi/tool: %s", event_type)
         return JSONResponse({})
 
+    call: dict        = message.get("call", {})
+    call_id: str      = call.get("id", "unknown")
+    control_url: str  = call.get("controlUrl", "")
+
     tool_list: list[dict] = message.get("toolWithToolCallList", [])
-    results: list[dict] = []
+    results: list[dict]   = []
 
     for tool in tool_list:
         function_name: str = tool.get("name", "")
-        tool_call: dict  = tool.get("toolCall", {})
-        tool_call_id: str = tool_call.get("id", "unknown")
-        params: dict     = tool_call.get("parameters", {})
+        tool_call: dict    = tool.get("toolCall", {})
+        tool_call_id: str  = tool_call.get("id", "unknown")
+        params: dict       = tool_call.get("parameters", {})
 
         if function_name != "collect_symptoms":
             logger.warning("Unknown tool at /vapi/tool: %s", function_name)
@@ -215,11 +222,23 @@ async def vapi_tool(request: Request) -> JSONResponse:
             })
             continue
 
-        result_str = _run_triage(params, tool_call_id)
+        result_str, risk_level = _run_triage(params, tool_call_id)
         results.append({
             "toolCallId": tool_call_id,
             "result": result_str,
         })
+
+        # Fire transfer in background so we don't delay the tool response
+        if risk_level == "RED" and control_url:
+            asyncio.create_task(
+                _transfer_to_doctor(control_url=control_url, call_id=call_id)
+            )
+        elif risk_level == "RED" and not control_url:
+            logger.warning(
+                "RED alert on call %s but no controlUrl — transfer skipped. "
+                "Ensure serverMessages includes 'tool-calls' with call object.",
+                call_id,
+            )
 
     return JSONResponse({"results": results})
 
@@ -228,24 +247,77 @@ async def vapi_tool(request: Request) -> JSONResponse:
 # Private helpers
 # ---------------------------------------------------------------------------
 
-def _run_triage(params: dict, tool_call_id: str) -> str:
+_BRIDGE_MESSAGE = (
+    "Behen, aapki sthiti gambhir lag rahi hai. "
+    "Main aapko doctor se connect kar rahi hoon."
+)
+
+
+async def _transfer_to_doctor(control_url: str, call_id: str) -> None:
     """
-    Map LLM tool parameters → evaluate_risk() input, run triage, return
-    a JSON string ready to be handed back to the LLM as a tool result.
+    Call the VAPI Live Call Control API to transfer the call to the doctor.
 
-    The LLM reads this JSON and then speaks the mandatory_action aloud
-    (the system prompt instructs it to do so verbatim).
+    This runs as a background asyncio task so the tool result is returned
+    to VAPI immediately (LLM starts speaking the bridge message) while the
+    transfer request is in-flight.
 
-    Mapping:
-        LLM param       → triage key          conversion
-        bleeding        → bleeding            direct (same enum values)
-        headache        → severe_headache     bool
-        fetal_movement  → fetal_movement      direct (same enum values)
-        fever           → fever               bool (default False)
-        swelling_feet   → swelling_feet       bool (default False)
-        abdominal_pain  → abdominal_pain      direct (default "none")
-        convulsions     → convulsions         bool (default False)
-        weeks_pregnant  → (passed through,    not used by triage rules yet)
+    VAPI Control API shape:
+        POST {controlUrl}
+        { "type": "transfer",
+          "destination": { "type": "number", "number": "+91..." },
+          "content": "<spoken before transfer>" }
+
+    Ref: https://docs.vapi.ai/calls/call-features (Transfer Call section)
+    """
+    settings = get_settings()
+    doctor_number: str = getattr(settings, "doctor_phone_number", "").strip()
+
+    if not doctor_number or doctor_number.startswith("your_"):
+        logger.error(
+            "RED alert on call %s but DOCTOR_PHONE_NUMBER not set in .env — "
+            "transfer aborted.",
+            call_id,
+        )
+        return
+
+    payload = {
+        "type": "transfer",
+        "destination": {
+            "type": "number",
+            "number": doctor_number,
+        },
+        "content": _BRIDGE_MESSAGE,
+    }
+
+    logger.info(
+        "RED emergency: transferring call %s to doctor %s",
+        call_id, doctor_number,
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(control_url, json=payload)
+            resp.raise_for_status()
+            logger.info(
+                "Transfer request accepted for call %s: HTTP %s",
+                call_id, resp.status_code,
+            )
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "Transfer failed for call %s: HTTP %s — %s",
+            call_id, exc.response.status_code, exc.response.text,
+        )
+    except Exception as exc:
+        logger.error("Transfer error for call %s: %s", call_id, exc)
+
+
+def _run_triage(params: dict, tool_call_id: str) -> tuple[str, str]:
+    """
+    Map LLM tool parameters → evaluate_risk() input, run triage.
+
+    Returns:
+        tuple of (result_json_string, risk_level)
+        risk_level is returned separately so the caller can branch on RED.
     """
     weeks: int = int(params.get("weeks_pregnant", 0))
 
@@ -271,44 +343,40 @@ def _run_triage(params: dict, tool_call_id: str) -> str:
         return json.dumps({
             "error": "Triage engine error. Please advise caller to visit nearest PHC.",
             "risk_level": "YELLOW",
-        })
+        }), "YELLOW"
 
-    risk_level: str      = triage["risk_level"]
-    mandatory_action: str = triage["mandatory_action"]
-    clinical_reason: str  = triage["clinical_reason"]
+    risk_level: str       = triage["risk_level"]
+    mandatory_action: str  = triage["mandatory_action"]
+    clinical_reason: str   = triage["clinical_reason"]
 
     logger.info(
         "Triage result: risk=%s  weeks=%d  action=%r",
         risk_level, weeks, mandatory_action[:60],
     )
 
-    # Build the updated system prompt so the LLM knows what to say.
-    # We return this as `system_prompt_update` — the LLM uses it as
-    # fresh context (supported via the tool result in Vapi's LLM context).
-    updated_prompt = build_system_prompt(
-        risk_level=risk_level,
-        mandatory_action=mandatory_action,
-        clinical_reason=clinical_reason,
-    )
-
-    result_payload = {
-        # === LLM-readable triage output ===
-        "risk_level":        risk_level,
-        "mandatory_action":  mandatory_action,
-        "clinical_reason":   clinical_reason,
-        "weeks_pregnant":    weeks,
-
-        # === Updated system prompt (injected into tool result context) ===
-        # The LLM will use this to know exactly what to say next.
-        "instructions": (
+    # For RED, prepend the bridge message so the LLM speaks it FIRST,
+    # then the mandatory_action. The actual call transfer is triggered
+    # as a separate background task in vapi_tool() above.
+    if risk_level == "RED":
+        spoken_instructions = (
+            f"{_BRIDGE_MESSAGE} "
+            f"TRIAGE COMPLETE. Risk level is RED. "
+            f'You MUST say EXACTLY: "{mandatory_action}" '
+            f"Then say: 'Behen, ABHI 108 par call karein. Yeh bahut zaroori hai.'"
+        )
+    else:
+        spoken_instructions = (
             f"TRIAGE COMPLETE. Risk level is {risk_level}. "
             f"You MUST now say the following EXACTLY word-for-word: "
             f'"{mandatory_action}"'
-            + (
-                " Then say: 'Behen, ABHI 108 par call karein. Yeh bahut zaroori hai.'"
-                if risk_level == "RED" else ""
-            )
-        ),
+        )
+
+    result_payload = {
+        "risk_level":       risk_level,
+        "mandatory_action": mandatory_action,
+        "clinical_reason":  clinical_reason,
+        "weeks_pregnant":   weeks,
+        "instructions":     spoken_instructions,
     }
 
-    return json.dumps(result_payload, ensure_ascii=False)
+    return json.dumps(result_payload, ensure_ascii=False), risk_level
