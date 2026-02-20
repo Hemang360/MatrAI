@@ -39,7 +39,7 @@ from fastapi.responses import JSONResponse
 from app.config import get_settings
 from app.prompts import INITIAL_SYSTEM_PROMPT
 from app.routers.vapi_tool import COLLECT_SYMPTOMS_TOOL
-from db.supabase_client import get_supabase_client
+from db.supabase_client import get_supabase_client, save_call_summary
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/vapi", tags=["VAPI"])
@@ -237,12 +237,10 @@ async def vapi_webhook(
         return JSONResponse({})
 
     # ------------------------------------------------------------------
-    # 4. end-of-call-report — log summary, no action needed yet
+    # 4. end-of-call-report — extract transcript + triage, persist to DB
     # ------------------------------------------------------------------
     if event_type == "end-of-call-report":
-        call_id = message.get("call", {}).get("id", "?")
-        ended_reason = message.get("endedReason", "unknown")
-        logger.info("Call %s ended. Reason: %s", call_id, ended_reason)
+        await _handle_end_of_call(message)
         return JSONResponse({})
 
     # ------------------------------------------------------------------
@@ -253,8 +251,110 @@ async def vapi_webhook(
 
 
 # ---------------------------------------------------------------------------
-# Sub-handlers
+# End-of-call persistence
 # ---------------------------------------------------------------------------
+
+async def _handle_end_of_call(message: dict) -> None:
+    """
+    Extract call data from the VAPI end-of-call-report payload and persist
+    it to the `calls` table (and `emergency_logs` for RED calls).
+
+    VAPI end-of-call-report payload shape (relevant fields):
+        message.call.id                       → vapi_call_id
+        message.call.customer.number          → caller phone
+        message.transcript                    → full raw transcript string
+        message.artifact.transcript           → same, from artifact object
+        message.call.analysis.summary         → AI-generated summary
+        message.endedReason                   → why the call ended
+
+    Triage state (risk_level, mandatory_action, symptoms) is NOT in the
+    end-of-call payload — VAPI doesn't persist our tool results for us.
+    We store what we CAN from the report, and annotate what's missing.
+    In a future iteration, we can keep server-side call state in Redis.
+    """
+    call:           dict = message.get("call", {})
+    vapi_call_id:   str  = call.get("id", "unknown")
+    ended_reason:   str  = message.get("endedReason", "unknown")
+
+    # --- Phone number ---------------------------------------------------------
+    caller_phone: str = (
+        call.get("customer", {}).get("number")
+        or call.get("phoneNumber", {}).get("number")
+        or "unknown"
+    )
+
+    logger.info(
+        "end-of-call-report: call=%s  phone=%s  reason=%s",
+        vapi_call_id, caller_phone, ended_reason,
+    )
+
+    # --- Transcript -----------------------------------------------------------
+    # VAPI puts the transcript in two places; prefer the top-level key.
+    # Format: list of {role, message} dicts OR a plain string.
+    raw_transcript = (
+        message.get("transcript")
+        or message.get("artifact", {}).get("transcript")
+        or []
+    )
+    if isinstance(raw_transcript, list):
+        # Convert [{"role": "assistant", "message": "Namaste..."}, ...] → plain text
+        lines = [
+            f"{turn.get('role', 'unknown').upper()}: {turn.get('message', '').strip()}"
+            for turn in raw_transcript
+            if turn.get("message")
+        ]
+        transcript_text: str = "\n".join(lines)
+    else:
+        transcript_text = str(raw_transcript)
+
+    # --- AI advice (VAPI analysis summary or fallback) ------------------------
+    ai_advice: str = (
+        call.get("analysis", {}).get("summary")
+        or message.get("summary", "")
+        or "(No summary generated)"
+    )
+
+    # --- Risk level -----------------------------------------------------------
+    # VAPI doesn't carry our triage state — we extract it from the transcript
+    # as a best-effort fallback. A full solution would use server-side state.
+    risk_level: str | None = _extract_risk_from_transcript(transcript_text)
+
+    logger.info(
+        "Saving call: vapi=%s  phone=%s  risk=%s  transcript_len=%d",
+        vapi_call_id, caller_phone, risk_level, len(transcript_text),
+    )
+
+    # --- Persist --------------------------------------------------------------
+    call_db_id = save_call_summary(
+        phone=caller_phone,
+        vapi_call_id=vapi_call_id,
+        transcript=transcript_text,
+        risk_level=risk_level,
+        symptoms_json=None,    # tool params not in end-of-call payload
+        ai_advice=ai_advice,
+    )
+
+    if call_db_id:
+        logger.info("Persisted call %s → calls.id=%s", vapi_call_id, call_db_id)
+    else:
+        logger.warning("Failed to persist call %s (see errors above)", vapi_call_id)
+
+
+def _extract_risk_from_transcript(transcript: str) -> str | None:
+    """
+    Heuristic: scan the transcript for risk level keywords injected by
+    the triage tool result (e.g. "Risk level is RED").
+
+    This is a best-effort fallback. In production, maintain server-side
+    call state (e.g. Redis keyed on call_id) to pass risk_level directly.
+    """
+    upper = transcript.upper()
+    if "RISK_LEVEL": pass   # silence linter — intentional simple scan below
+    for level in ("RED", "YELLOW", "GREEN"):
+        if f"RISK LEVEL IS {level}" in upper or f'"RISK_LEVEL": "{level}"' in upper:
+            return level
+    return None
+
 
 async def _handle_assistant_request(message: dict) -> JSONResponse:
     """
