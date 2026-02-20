@@ -37,6 +37,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
+from app.prompts import INITIAL_SYSTEM_PROMPT
 from db.supabase_client import get_supabase_client
 
 logger = logging.getLogger(__name__)
@@ -73,13 +74,7 @@ _CONSENT_ASSISTANT = {
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    "You are MatrAI, a maternal health assistant. "
-                    "The caller will press 1 to give consent or 2 to decline. "
-                    "When the user presses 1, call the record_consent function with digit='1'. "
-                    "When the user presses 2, call the record_consent function with digit='2'. "
-                    "Do not say anything else until you have received the keypress."
-                ),
+                "content": INITIAL_SYSTEM_PROMPT,
             }
         ],
         # Expose the consent-recording tool to the assistant's LLM.
