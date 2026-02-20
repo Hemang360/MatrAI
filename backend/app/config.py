@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     # VAPI (Voice API)
     vapi_api_key: str
     vapi_webhook_secret: str = ""   # optional — leave blank to skip verification
+    # Base URL of this server (used to build tool server URLs sent to VAPI).
+    # Set to your ngrok URL locally, or your production domain in prod.
+    # Example: https://abc123.ngrok-free.app
+    base_url: str = "http://localhost:8000"
 
     # Sarvam AI
     sarvam_api_key: str

@@ -38,6 +38,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import get_settings
 from app.prompts import INITIAL_SYSTEM_PROMPT
+from app.routers.vapi_tool import COLLECT_SYMPTOMS_TOOL
 from db.supabase_client import get_supabase_client
 
 logger = logging.getLogger(__name__)
@@ -48,71 +49,81 @@ router = APIRouter(prefix="/vapi", tags=["VAPI"])
 # ---------------------------------------------------------------------------
 
 # URL where the static consent audio is served.
-# In production replace BASE_URL with your actual domain.
-# e.g. "https://api.matrai.in/static/consent_hi.wav"
+# In production replace with your actual domain, e.g. "https://api.matrai.in"
 _BASE_URL = "http://localhost:8000"
 _CONSENT_AUDIO_URL = f"{_BASE_URL}/static/consent_hi.wav"
 
-# The transient assistant definition returned on every inbound call.
-# VAPI will use this configuration for the duration of the call
-# without requiring a pre-saved assistant in the VAPI dashboard.
-_CONSENT_ASSISTANT = {
-    # firstMessage is spoken immediately when the call connects.
-    # We point VAPI at our static Hindi consent audio file.
-    "firstMessage": (
-        "Hum is call ko record karenge taaki doctor ise dekh sakein. "
-        "Sehmati dene ke liye 1 dabayein, anyatha 2 dabayein."
-    ),
-    "voice": {
-        # Use Sarvam's Bulbul TTS so the message is spoken in Hindi.
-        "provider": "sarvam",
-        "voiceId": "priya",
-    },
-    "model": {
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-        "messages": [
-            {
-                "role": "system",
-                "content": INITIAL_SYSTEM_PROMPT,
-            }
-        ],
-        # Expose the consent-recording tool to the assistant's LLM.
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "record_consent",
-                    "description": (
-                        "Records whether the caller consented to call recording. "
-                        "Call this when the user presses 1 (consent) or 2 (decline)."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "digit": {
-                                "type": "string",
-                                "enum": ["1", "2"],
-                                "description": "DTMF digit pressed by the caller: '1' = consent, '2' = decline.",
+
+def _build_assistant(base_url: str = _BASE_URL) -> dict:
+    """
+    Build the transient VAPI assistant definition at call-time.
+
+    Injecting base_url at runtime means we can point tool server URLs at
+    the live ngrok tunnel (or production domain) without hardcoding.
+
+    Args:
+        base_url: Root URL of this FastAPI server (no trailing slash).
+    """
+    # Deep-copy the schema so we don't mutate the module-level constant
+    import copy
+    tool_def = copy.deepcopy(COLLECT_SYMPTOMS_TOOL)
+    tool_def["server"]["url"] = f"{base_url}/vapi/tool"
+
+    return {
+        "firstMessage": (
+            "Hum is call ko record karenge taaki doctor ise dekh sakein. "
+            "Sehmati dene ke liye 1 dabayein, anyatha 2 dabayein."
+        ),
+        "voice": {
+            "provider": "sarvam",
+            "voiceId": "priya",
+        },
+        "model": {
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": INITIAL_SYSTEM_PROMPT,
+                }
+            ],
+            "tools": [
+                # Tool 1: Consent via DTMF keypress
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "record_consent",
+                        "description": (
+                            "Records whether the caller consented to call recording. "
+                            "Call this when the user presses 1 (consent) or 2 (decline)."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "digit": {
+                                    "type": "string",
+                                    "enum": ["1", "2"],
+                                    "description": "DTMF digit: '1' = consent, '2' = decline.",
+                                },
+                                "phone_number": {
+                                    "type": "string",
+                                    "description": "Caller's phone number in E.164 format.",
+                                },
                             },
-                            "phone_number": {
-                                "type": "string",
-                                "description": "Caller's phone number in E.164 format.",
-                            },
+                            "required": ["digit"],
                         },
-                        "required": ["digit"],
                     },
                 },
-            }
+                # Tool 2: Symptom collection → triage (posts to /vapi/tool)
+                tool_def,
+            ],
+        },
+        "serverMessages": [
+            "tool-calls",
+            "status-update",
+            "end-of-call-report",
         ],
-    },
-    # Send all server events to this same webhook route.
-    "serverMessages": [
-        "tool-calls",
-        "status-update",
-        "end-of-call-report",
-    ],
-}
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -247,10 +258,14 @@ async def vapi_webhook(
 
 async def _handle_assistant_request(message: dict) -> JSONResponse:
     """
-    Respond to an inbound call with a transient consent-collection assistant.
+    Respond to an inbound call with a transient assistant.
 
-    VAPI requires a response within 7.5 seconds. We return a pre-built
-    assistant object synchronously — no DB calls in the hot path.
+    The assistant has two tools:
+      1. record_consent  — consent via DTMF (posts to /vapi/webhook)
+      2. collect_symptoms — triage engine (posts to /vapi/tool)
+
+    VAPI requires a response within 7.5 seconds. We build the assistant
+    definition synchronously — no DB calls in the hot path.
     """
     call = message.get("call", {})
     caller_phone = (
@@ -261,11 +276,15 @@ async def _handle_assistant_request(message: dict) -> JSONResponse:
     call_id = call.get("id", "unknown")
 
     logger.info(
-        "Inbound call: id=%s  caller=%s — returning consent assistant",
+        "Inbound call: id=%s  caller=%s — returning MatrAI assistant",
         call_id, caller_phone,
     )
 
-    return JSONResponse({"assistant": _CONSENT_ASSISTANT})
+    # Resolve base_url from settings if configured, else fall back to default
+    _settings = get_settings()
+    base_url: str = getattr(_settings, "base_url", _BASE_URL) or _BASE_URL
+
+    return JSONResponse({"assistant": _build_assistant(base_url)})
 
 
 async def _handle_tool_calls(message: dict) -> JSONResponse:

@@ -6,6 +6,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
 from app.routers import vapi as vapi_router
+from app.routers import vapi_tool as vapi_tool_router
 
 settings = get_settings()
 
@@ -37,6 +38,7 @@ app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 # Routers
 # ---------------------------------------------------------------------------
 app.include_router(vapi_router.router)
+app.include_router(vapi_tool_router.router)
 
 
 # ---------------------------------------------------------------------------
