@@ -71,7 +71,7 @@ CLIPS: list[AudioClip] = [
             "aapki madad karti hoon. Kripya apni baat shuru karein."
         ),
         language_code="hi-IN",
-        speaker="anushka",   # warm female voice — appropriate for healthcare IVR
+        speaker="priya",   # warm female voice — valid bulbul:v3 speaker
         pace=0.90,           # slightly slower for first-time callers
     ),
     AudioClip(
@@ -81,7 +81,7 @@ CLIPS: list[AudioClip] = [
             "Sehmati dene ke liye 1 dabayein, anyatha 2 dabayein."
         ),
         language_code="hi-IN",
-        speaker="anushka",
+        speaker="priya",
         pace=0.88,           # consent must be clearly audible
     ),
 ]

@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     # VAPI (Voice API)
     vapi_api_key: str
+    vapi_webhook_secret: str = ""   # optional — leave blank to skip verification
 
     # Sarvam AI
     sarvam_api_key: str
