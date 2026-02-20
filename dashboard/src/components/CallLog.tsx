@@ -8,11 +8,13 @@
  *      → catches any events Supabase Realtime might miss
  *
  * Sort order: RED first → YELLOW → GREEN → unknown, then newest within each tier.
+ * Row click → opens CallDetailModal with full transcript, symptoms, ASHA button.
  */
 import { useEffect, useRef, useState } from 'react';
-import { PhoneCall, Clock, Wifi } from 'lucide-react';
+import { PhoneCall, Clock, Wifi, ChevronRight } from 'lucide-react';
 import { supabase, type Call } from '../lib/supabase';
 import RiskBadge from './RiskBadge';
+import CallDetailModal from './CallDetailModal';
 
 // Risk sort priority (lower = higher in list)
 const RISK_PRIORITY: Record<string, number> = { RED: 0, YELLOW: 1, GREEN: 2 };
@@ -35,22 +37,20 @@ function rowClass(risk: string | null): string {
 interface CallLogProps {
     /** How many rows to show (default 50) */
     limit?: number;
-    /** Optional search string to filter by phone */
+    /** Optional search string to filter by phone / risk */
     search?: string;
-    /** Show expanded transcript on click */
-    expandable?: boolean;
 }
 
-export default function CallLog({ limit = 50, search = '', expandable = true }: CallLogProps) {
+export default function CallLog({ limit = 50, search = '' }: CallLogProps) {
     const [calls, setCalls] = useState<Call[]>([]);
     const [loading, setLoading] = useState(true);
     const [liveStatus, setLiveStatus] = useState<'connecting' | 'live' | 'poll'>('connecting');
-    const [expanded, setExpanded] = useState<string | null>(null);
-    const [newIds, setNewIds] = useState<Set<string>>(new Set()); // flash animation
+    const [selected, setSelected] = useState<Call | null>(null);
+    const [newIds, setNewIds] = useState<Set<string>>(new Set());
     const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
     // -----------------------------------------------------------------------
-    // Fetch helpers
+    // Data fetching
     // -----------------------------------------------------------------------
     const fetchCalls = async () => {
         const { data } = await supabase
@@ -63,7 +63,7 @@ export default function CallLog({ limit = 50, search = '', expandable = true }: 
     };
 
     // -----------------------------------------------------------------------
-    // Initial load + Supabase Realtime subscription
+    // Initial load + Supabase Realtime
     // -----------------------------------------------------------------------
     useEffect(() => {
         fetchCalls();
@@ -74,7 +74,6 @@ export default function CallLog({ limit = 50, search = '', expandable = true }: 
                 'postgres_changes',
                 { event: 'INSERT', schema: 'public', table: 'calls' },
                 async (payload) => {
-                    // New row arrived — fetch the full row (with joined phone number)
                     const { data } = await supabase
                         .from('calls')
                         .select('*, users(phone, language)')
@@ -83,7 +82,6 @@ export default function CallLog({ limit = 50, search = '', expandable = true }: 
 
                     if (data) {
                         setCalls(prev => sortCalls([data, ...prev].slice(0, limit)));
-                        // Flash the new row for 3s
                         setNewIds(ids => new Set([...ids, data.id]));
                         setTimeout(() => {
                             setNewIds(ids => { const n = new Set(ids); n.delete(data.id); return n; });
@@ -96,12 +94,11 @@ export default function CallLog({ limit = 50, search = '', expandable = true }: 
                     setLiveStatus('live');
                 } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
                     setLiveStatus('poll');
-                    // Fall back to polling every 5s
                     pollRef.current = setInterval(fetchCalls, 5000);
                 }
             });
 
-        // 30-second safety-net poll regardless of realtime status
+        // 30-second safety-net poll
         const safetyPoll = setInterval(fetchCalls, 30_000);
 
         return () => {
@@ -125,67 +122,63 @@ export default function CallLog({ limit = 50, search = '', expandable = true }: 
     // Render
     // -----------------------------------------------------------------------
     return (
-        <div className="glass rounded-xl overflow-hidden">
-            {/* Header */}
-            <div className="flex items-center justify-between px-5 py-3.5
-                      border-b border-slate-700/50">
-                <h2 className="font-semibold text-white text-sm">Live Call Feed</h2>
-                <div className="flex items-center gap-2 text-xs">
-                    {liveStatus === 'live' && (
-                        <>
-                            <span className="live-dot" />
-                            <span className="text-emerald-400 font-medium">Live</span>
-                        </>
-                    )}
-                    {liveStatus === 'poll' && (
-                        <>
-                            <Wifi size={12} className="text-amber-400" />
-                            <span className="text-amber-400 font-medium">Polling</span>
-                        </>
-                    )}
-                    {liveStatus === 'connecting' && (
-                        <span className="text-slate-500">Connecting…</span>
-                    )}
-                </div>
-            </div>
-
-            {/* Column headers */}
-            <div className="grid grid-cols-12 gap-3 px-5 py-2.5 border-b border-slate-800
-                      text-xs font-medium text-slate-500 uppercase tracking-wide">
-                <div className="col-span-2">Time</div>
-                <div className="col-span-3">Phone</div>
-                <div className="col-span-2">Risk</div>
-                <div className="col-span-5">Summary / Advice</div>
-            </div>
-
-            {/* Rows */}
-            <div className="divide-y divide-slate-800/60">
-                {loading ? (
-                    Array.from({ length: 5 }).map((_, i) => (
-                        <div key={i} className="px-5 py-4 animate-pulse flex gap-4">
-                            <div className="h-3.5 bg-slate-800 rounded w-full" />
-                        </div>
-                    ))
-                ) : filtered.length === 0 ? (
-                    <div className="px-5 py-14 text-center">
-                        <PhoneCall size={36} className="text-slate-700 mx-auto mb-3" />
-                        <p className="text-slate-500 text-sm">
-                            {search ? 'No calls match your search.' : 'No calls yet — waiting for the first call…'}
-                        </p>
+        <>
+            <div className="glass rounded-xl overflow-hidden">
+                {/* Header */}
+                <div className="flex items-center justify-between px-5 py-3.5
+                        border-b border-slate-700/50">
+                    <h2 className="font-semibold text-white text-sm">Live Call Feed</h2>
+                    <div className="flex items-center gap-2 text-xs">
+                        {liveStatus === 'live' && (
+                            <><span className="live-dot" /><span className="text-emerald-400 font-medium">Live</span></>
+                        )}
+                        {liveStatus === 'poll' && (
+                            <><Wifi size={12} className="text-amber-400" /><span className="text-amber-400 font-medium">Polling</span></>
+                        )}
+                        {liveStatus === 'connecting' && (
+                            <span className="text-slate-500">Connecting…</span>
+                        )}
                     </div>
-                ) : (
-                    filtered.map(call => {
-                        const isNew = newIds.has(call.id);
-                        return (
-                            <div key={call.id}>
+                </div>
+
+                {/* Column headers */}
+                <div className="grid grid-cols-12 gap-3 px-5 py-2.5 border-b border-slate-800
+                        text-xs font-medium text-slate-500 uppercase tracking-wide">
+                    <div className="col-span-2">Time</div>
+                    <div className="col-span-3">Phone</div>
+                    <div className="col-span-2">Risk</div>
+                    <div className="col-span-4">Summary / Advice</div>
+                    <div className="col-span-1" />
+                </div>
+
+                {/* Rows */}
+                <div className="divide-y divide-slate-800/60">
+                    {loading ? (
+                        Array.from({ length: 5 }).map((_, i) => (
+                            <div key={i} className="px-5 py-4 animate-pulse flex gap-4">
+                                <div className="h-3.5 bg-slate-800 rounded w-full" />
+                            </div>
+                        ))
+                    ) : filtered.length === 0 ? (
+                        <div className="px-5 py-14 text-center">
+                            <PhoneCall size={36} className="text-slate-700 mx-auto mb-3" />
+                            <p className="text-slate-500 text-sm">
+                                {search ? 'No calls match your search.' : 'No calls yet — waiting for the first call…'}
+                            </p>
+                        </div>
+                    ) : (
+                        filtered.map(call => {
+                            const isNew = newIds.has(call.id);
+                            return (
                                 <button
-                                    onClick={() => expandable && setExpanded(expanded === call.id ? null : call.id)}
+                                    key={call.id}
+                                    onClick={() => setSelected(call)}
                                     className={`
                     w-full grid grid-cols-12 gap-3 px-5 py-3.5 text-left
-                    transition-all duration-300
+                    transition-all duration-300 cursor-pointer hover:brightness-125
+                    group
                     ${rowClass(call.risk_level)}
                     ${isNew ? 'ring-1 ring-inset ring-brand-500/40' : ''}
-                    ${expandable ? 'cursor-pointer hover:brightness-125' : 'cursor-default'}
                   `}
                                 >
                                     {/* Time */}
@@ -193,12 +186,12 @@ export default function CallLog({ limit = 50, search = '', expandable = true }: 
                                         <Clock size={11} className="shrink-0 text-slate-500" />
                                         <span>
                                             {new Date(call.created_at).toLocaleTimeString('en-IN', {
-                                                hour: '2-digit', minute: '2-digit', hour12: true
+                                                hour: '2-digit', minute: '2-digit', hour12: true,
                                             })}
                                             <br />
                                             <span className="text-slate-600">
                                                 {new Date(call.created_at).toLocaleDateString('en-IN', {
-                                                    day: '2-digit', month: 'short'
+                                                    day: '2-digit', month: 'short',
                                                 })}
                                             </span>
                                         </span>
@@ -218,54 +211,33 @@ export default function CallLog({ limit = 50, search = '', expandable = true }: 
                                     </div>
 
                                     {/* Summary */}
-                                    <div className="col-span-5 text-xs text-slate-400 flex items-center truncate">
+                                    <div className="col-span-4 text-xs text-slate-400 flex items-center">
                                         <span className="truncate">
-                                            {call.ai_advice?.slice(0, 90) ?? '—'}
+                                            {call.ai_advice?.slice(0, 80) ?? '—'}
                                         </span>
                                     </div>
-                                </button>
 
-                                {/* Expanded detail panel */}
-                                {expandable && expanded === call.id && (
-                                    <div className="px-5 pb-5 pt-3 bg-slate-900/60 space-y-4
-                                  border-t border-slate-800/60">
-                                        {call.ai_advice && (
-                                            <div>
-                                                <p className="text-xs font-semibold text-slate-500 uppercase
-                                      tracking-wide mb-1.5">AI Advice</p>
-                                                <p className="text-sm text-slate-300 leading-relaxed">
-                                                    {call.ai_advice}
-                                                </p>
-                                            </div>
-                                        )}
-                                        {call.transcript && (
-                                            <div>
-                                                <p className="text-xs font-semibold text-slate-500 uppercase
-                                      tracking-wide mb-1.5">Transcript</p>
-                                                <pre className="text-xs text-slate-400 bg-slate-950 rounded-lg p-4
-                                        overflow-x-auto whitespace-pre-wrap font-mono
-                                        leading-relaxed max-h-64 overflow-y-auto">
-                                                    {call.transcript}
-                                                </pre>
-                                            </div>
-                                        )}
-                                        {call.symptoms_json && Object.keys(call.symptoms_json).length > 0 && (
-                                            <div>
-                                                <p className="text-xs font-semibold text-slate-500 uppercase
-                                      tracking-wide mb-1.5">Symptoms</p>
-                                                <pre className="text-xs text-slate-400 bg-slate-950 rounded-lg p-4
-                                        overflow-x-auto font-mono">
-                                                    {JSON.stringify(call.symptoms_json, null, 2)}
-                                                </pre>
-                                            </div>
-                                        )}
+                                    {/* Chevron hint */}
+                                    <div className="col-span-1 flex items-center justify-end">
+                                        <ChevronRight
+                                            size={14}
+                                            className="text-slate-700 group-hover:text-slate-400 transition-colors"
+                                        />
                                     </div>
-                                )}
-                            </div>
-                        );
-                    })
-                )}
+                                </button>
+                            );
+                        })
+                    )}
+                </div>
             </div>
-        </div>
+
+            {/* Detail Modal */}
+            {selected && (
+                <CallDetailModal
+                    call={selected}
+                    onClose={() => setSelected(null)}
+                />
+            )}
+        </>
     );
 }
