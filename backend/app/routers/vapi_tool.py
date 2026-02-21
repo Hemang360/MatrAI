@@ -46,6 +46,7 @@ from fastapi.responses import JSONResponse
 from app.config import get_settings
 from app.prompts import build_system_prompt
 from app.triage import evaluate_risk
+from db.supabase_client import save_call_summary
 
 logger = logging.getLogger(__name__)
 
@@ -209,10 +210,35 @@ async def vapi_tool(request: Request) -> JSONResponse:
     results: list[dict]   = []
 
     for tool in tool_list:
-        function_name: str = tool.get("name", "")
+        # VAPI sends tool payload in different shapes depending on how the tool was registered:
+        # Format A — transient/webhook tool:  tool["name"]  +  toolCall["parameters"]
+        # Format B — dashboard-created tool:  toolCall["function"]["name"]  +  toolCall["function"]["arguments"] (JSON str)
         tool_call: dict    = tool.get("toolCall", {})
-        tool_call_id: str  = tool_call.get("id", "unknown")
-        params: dict       = tool_call.get("parameters", {})
+        tc_function: dict  = tool_call.get("function", {})
+
+        function_name: str = (
+            tool.get("name")                        # Format A
+            or tc_function.get("name")              # Format B
+            or ""
+        )
+        tool_call_id: str = tool_call.get("id", "unknown")
+
+        # Parameters — may be a dict (Format A) or JSON string (Format B)
+        raw_params = (
+            tc_function.get("arguments")            # Format B (JSON string or dict)
+            or tool_call.get("parameters")          # Format A
+            or {}
+        )
+        if isinstance(raw_params, str):
+            try:
+                params: dict = json.loads(raw_params)
+            except Exception:
+                params = {}
+        else:
+            params = raw_params or {}
+
+        logger.info("Tool call received: name=%r  id=%r  params=%r", function_name, tool_call_id, params)
+
 
         if function_name != "collect_symptoms":
             logger.warning("Unknown tool at /vapi/tool: %s", function_name)
@@ -227,6 +253,26 @@ async def vapi_tool(request: Request) -> JSONResponse:
             "toolCallId": tool_call_id,
             "result": result_str,
         })
+
+        # Persist triage result to Supabase immediately — this is the only
+        # moment we have risk_level + symptoms + call_id all at once.
+        # The end-of-call handler can't reliably extract risk_level from a
+        # Hindi transcript, so we save here and the webhook just fills in
+        # the transcript/summary when the call ends.
+        caller_phone: str = (
+            call.get("customer", {}).get("number")
+            or call.get("phoneNumber", {}).get("number")
+            or "unknown"
+        )
+        asyncio.create_task(
+            _save_triage_result(
+                vapi_call_id=call_id,
+                phone=caller_phone,
+                risk_level=risk_level,
+                symptoms=params,
+                triage_json=result_str,
+            )
+        )
 
         # Fire transfer in background so we don't delay the tool response
         if risk_level == "RED" and control_url:
@@ -309,6 +355,48 @@ async def _transfer_to_doctor(control_url: str, call_id: str) -> None:
         )
     except Exception as exc:
         logger.error("Transfer error for call %s: %s", call_id, exc)
+
+
+async def _save_triage_result(
+    vapi_call_id: str,
+    phone: str,
+    risk_level: str,
+    symptoms: dict,
+    triage_json: str,
+) -> None:
+    """
+    Persist the triage result to Supabase immediately after the tool runs.
+
+    We do this here (not only in the end-of-call handler) because:
+    - At tool-call time we have the EXACT risk_level from evaluate_risk().
+    - The end-of-call handler parses risk_level from the Hindi transcript
+      where "RED"/"YELLOW"/"GREEN" keywords may not appear.
+
+    The end-of-call handler will UPDATE this row with the full transcript
+    and AI summary once the call ends (using vapi_call_id as the key).
+    """
+    try:
+        import json as _json
+        result_data = _json.loads(triage_json)
+        ai_advice = result_data.get("mandatory_action", "")
+    except Exception:
+        ai_advice = ""
+
+    call_db_id = save_call_summary(
+        phone=phone,
+        vapi_call_id=vapi_call_id,
+        transcript=None,          # filled in by end-of-call handler
+        risk_level=risk_level,
+        symptoms_json=symptoms,
+        ai_advice=ai_advice,
+    )
+    if call_db_id:
+        logger.info(
+            "✅ Triage saved: vapi=%s  phone=%s  risk=%s  db_id=%s",
+            vapi_call_id, phone, risk_level, call_db_id,
+        )
+    else:
+        logger.warning("⚠️  Triage save failed for call %s", vapi_call_id)
 
 
 def _run_triage(params: dict, tool_call_id: str) -> tuple[str, str]:
