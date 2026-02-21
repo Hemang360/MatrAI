@@ -56,9 +56,9 @@ export default function CallDetailModal({ call, onClose }: CallDetailModalProps)
     // -----------------------------------------------------------------------
     const handleNotifyAsha = () => {
         const phone = call.users?.phone ?? 'Unknown';
-        const risk = call.risk_level ?? 'Unknown';
         const reason = clinicalReason || call.ai_advice?.slice(0, 80) || 'High risk detected';
         const message = `[MOCK SMS]: Alerting ASHA for Patient at ${phone} – High Risk: ${reason}`;
+
 
         console.log(message);
         setNotified(true);

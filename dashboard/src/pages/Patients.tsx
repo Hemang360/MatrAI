@@ -1,23 +1,23 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import { Users, CheckCircle, XCircle, Search } from 'lucide-react';
 import { fetchUsers, type User } from '../lib/supabase';
 
 export default function PatientsPage() {
     const [users, setUsers] = useState<User[]>([]);
-    const [filtered, setFiltered] = useState<User[]>([]);
     const [search, setSearch] = useState('');
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
         fetchUsers(100)
-            .then(r => { setUsers(r.data ?? []); setFiltered(r.data ?? []); })
+            .then(r => setUsers(r.data ?? []))
             .finally(() => setLoading(false));
     }, []);
 
-    useEffect(() => {
+    const filtered = useMemo(() => {
         const q = search.toLowerCase();
-        setFiltered(users.filter(u => u.phone.includes(q)));
+        return users.filter(u => u.phone.includes(q));
     }, [search, users]);
+
 
     return (
         <div className="space-y-6">

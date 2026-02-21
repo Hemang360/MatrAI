@@ -25,7 +25,7 @@ export default function CallsPage() {
                 </div>
             </div>
 
-            <CallLog limit={100} search={search} expandable />
+            <CallLog limit={100} search={search} />
         </div>
     );
 }

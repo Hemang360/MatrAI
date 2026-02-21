@@ -16,10 +16,10 @@ export default function DashboardPage() {
     const [stats, setStats] = useState({ totalCalls: 0, totalUsers: 0, redAlerts: 0, emergencyLogs: 0 });
     const [loadingStats, setLoadingStats] = useState(true);
 
-    const loadStats = () =>
-        fetchStats().then(s => { setStats(s); setLoadingStats(false); });
-
     useEffect(() => {
+        const loadStats = () =>
+            fetchStats().then(s => { setStats(s); setLoadingStats(false); });
+
         loadStats();
 
         // Refresh stat counts when a new call is inserted
@@ -29,8 +29,8 @@ export default function DashboardPage() {
             .subscribe();
 
         return () => { supabase.removeChannel(ch); };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
 
     const statCards: Stat[] = [
         { label: 'Total Calls', value: stats.totalCalls, icon: PhoneCall, color: 'text-brand-400', shadow: 'shadow-brand-500/20' },
@@ -67,7 +67,8 @@ export default function DashboardPage() {
             </div>
 
             {/* Live Call Feed */}
-            <CallLog limit={20} expandable />
+            <CallLog limit={20} />
+
         </div>
     );
 }
